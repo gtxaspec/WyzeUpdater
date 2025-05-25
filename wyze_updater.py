@@ -67,7 +67,40 @@ def auth_api(url, phone_id, params={}, payload={}):
     logging.debug(rsp)
     return rsp
 
+def wyze_login_api_key(email, password, key_id, api_key):
+    """Login using API key and credentials"""
+    AUTH_LOGIN_URL = "/api/user/login"
+    
+    # Hash password three times with MD5 as per API requirements
+    for i in range(0, 3):
+        password = hashlib.md5(password.encode('ascii')).hexdigest()
+    
+    headers = {
+        'Keyid': key_id,
+        'Apikey': api_key,
+        'Content-Type': 'application/json',
+    }
+    
+    payload = {'email': email, 'password': password}
+    
+    rsp = requests.post(
+        AUTH_BASE_URL + AUTH_LOGIN_URL, headers=headers, json=payload).json()
+    logging.debug(rsp)
+    
+    if 'access_token' not in rsp or not rsp['access_token']:
+        raise WyzeApiError({'code': 'AUTH_FAILED', 'msg': 'Authentication failed: ' + str(rsp)})
+    
+    return {
+        'phone_id': 'wyze_developer_api',  # Use a fixed phone_id for API key auth
+        'user_id': rsp.get('user_id', ''),
+        'access_token': rsp['access_token'],
+        'refresh_token': rsp['refresh_token'],
+        'key_id': key_id,
+        'api_key': api_key,
+    }
+
 def wyze_login(email, password):
+    """Legacy login method - kept for backward compatibility"""
     AUTH_LOGIN_URL = "/user/login"
     AUTH_SEND_SMS_CODE_URL = AUTH_LOGIN_URL + "/sendSmsCode"
 
@@ -133,9 +166,34 @@ def device_api(creds, url, sv, **params):
     return rsp['data']
 
 def refresh_token(creds):
-    URL_REFRESH_TOKEN = "/app/user/refresh_token"
-    SV_REFRESH_TOKEN = "d91914dd28b7492ab9dd17f7707d35a3"
-    return device_api(creds, URL_REFRESH_TOKEN, SV_REFRESH_TOKEN, refresh_token=creds["refresh_token"])
+    """Refresh access token using the appropriate method based on auth type"""
+    if 'api_key' in creds and 'key_id' in creds:
+        # Use new API endpoint for API key authentication
+        URL_REFRESH_TOKEN = "/app/user/refresh_token"
+        payload = {
+            "app_ver": "wyze_developer_api",
+            "app_version": "wyze_developer_api",
+            "phone_id": "wyze_developer_api",
+            "refresh_token": creds["refresh_token"],
+            "sc": "wyze_developer_api",
+            "sv": "wyze_developer_api",
+            "ts": 4070908800000
+        }
+        
+        headers = {'Content-Type': 'application/json'}
+        rsp = requests.post(
+            API_BASE_URL + URL_REFRESH_TOKEN, headers=headers, json=payload).json()
+        logging.debug(rsp)
+        
+        if rsp.get('code') != '1' and rsp.get('code') != 1:
+            raise WyzeApiError(rsp)
+        
+        return rsp['data']
+    else:
+        # Use legacy method for non-API key authentication
+        URL_REFRESH_TOKEN = "/app/user/refresh_token"
+        SV_REFRESH_TOKEN = "d91914dd28b7492ab9dd17f7707d35a3"
+        return device_api(creds, URL_REFRESH_TOKEN, SV_REFRESH_TOKEN, refresh_token=creds["refresh_token"])
 
 def get_object_list(creds):
     URL_V2_GET_OBJECT_LIST = "/app/v2/home_page/get_object_list"
@@ -188,25 +246,44 @@ def fetch_ota_info(creds, args):
     payload = {
         "sc" : API_SC,
         "sv" : UPDATE_VERSION_LIST_SV,
-        "devicelist" : devicelist
+        "devicelist" : json.dumps(devicelist)  # Convert devicelist to JSON string
     }
-    rsp = requests.post(
+    
+    logging.debug("Sending payload: %s", payload)
+    
+    response = requests.post(
         UPDATE_VERSION_LIST_URL,
         headers={
             'User-Agent': USER_AGENT,
             'Content-Type': 'application/x-www-form-urlencoded'
         },
-        data=urllib.parse.urlencode(payload)).json()
+        data=urllib.parse.urlencode(payload))
+    
+    logging.debug("Response status: %s", response.status_code)
+    logging.debug("Response text: %s", response.text)
+    
+    if not response.text:
+        print("No OTA update information available from server")
+        return
+        
+    try:
+        rsp = response.json()
+    except json.JSONDecodeError:
+        print("Failed to parse OTA response. Raw response:")
+        print(response.text)
+        return
+        
+    if 'data' not in rsp:
+        print("No update data in response")
+        return
+        
     for x in rsp['data']:
         print("mac=%s, cur_ver=%s, model=%s" % (x["mac"], x["currentversion"], x["productmodel"]))
-        for pkg in x["package"]:
+        for pkg in x.get("package", []):
             print("version=%s, url=%s" % (pkg["version"], pkg["url"]))
 
 def start_http_server(firmware_data, addr, port, use_ssl):
     class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-
         def do_GET(self):
             logging.debug("request received, path=%s" % self.path)
             self.send_response(200)
@@ -215,7 +292,12 @@ def start_http_server(firmware_data, addr, port, use_ssl):
             self.send_header('Content-Length', len(firmware_data))
             self.end_headers()
 
-            self.wfile.write(firmware_data)
+            try:
+                self.wfile.write(firmware_data)
+                self.wfile.flush()
+                logging.debug("Successfully served firmware file, size=%d bytes" % len(firmware_data))
+            except Exception as e:
+                logging.error("Error serving firmware: %s" % str(e))
             return
 
     if not port:
@@ -224,11 +306,9 @@ def start_http_server(firmware_data, addr, port, use_ssl):
     server_address = (addr, port)
     httpd = http.server.HTTPServer(server_address, Handler)
     if use_ssl:
-        httpd.socket = ssl.wrap_socket(httpd.socket,
-                                    server_side=True,
-                                    certfile='testcert/cert.pem',
-                                    keyfile='testcert/key.pem',
-                                    ssl_version=ssl.PROTOCOL_TLS)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(certfile='testcert/cert.pem', keyfile='testcert/key.pem')
+        httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
 
     threading.Thread(target=httpd.serve_forever).start()
     return httpd
@@ -260,6 +340,7 @@ def update_devices(creds, args):
 
     firmware_data = open(args.firmware, 'rb').read()
     md5 = hashlib.md5(firmware_data).hexdigest()
+    logging.info("Loaded firmware file '%s', size=%d bytes, md5=%s" % (args.firmware, len(firmware_data), md5))
 
     server = None
     for mac in args.devices:
@@ -322,6 +403,12 @@ parser.add_argument(
 parser.add_argument(
     '--password',
     help='Password of the associated wyze account.')
+parser.add_argument(
+    '--key-id',
+    help='API Key ID from Wyze developer portal.')
+parser.add_argument(
+    '--api-key',
+    help='API Key from Wyze developer portal.')
 parser.add_argument(
     '--token',
     default=os.path.expanduser("~/.wyze_token"),
@@ -404,7 +491,11 @@ try:
     
     tokens = refresh_token(creds)
     if creds["access_token"] != tokens["access_token"] or creds["refresh_token"] != tokens["refresh_token"]:
-        creds = {**creds, **tokens, "refreshed" : True}
+        # Preserve API key information if present
+        if 'api_key' in creds and 'key_id' in creds:
+            creds = {**creds, **tokens, "refreshed" : True, "api_key": creds["api_key"], "key_id": creds["key_id"]}
+        else:
+            creds = {**creds, **tokens, "refreshed" : True}
 except OSError:
     logging.warning("No saved credentials found, will try login with username/password...")
     creds = {}
@@ -418,8 +509,24 @@ if not creds:
     
     if not args.password:
         args.password = input("Please enter the password:")
-
-    creds = wyze_login(args.user, args.password)
+    
+    # Check if API key authentication should be used
+    if args.key_id and args.api_key:
+        logging.info("Using API key authentication")
+        creds = wyze_login_api_key(args.user, args.password, args.key_id, args.api_key)
+    else:
+        # Prompt for API key if not provided
+        use_api_key = input("Do you have a Wyze API key? [y/N]: ")
+        if use_api_key.upper() == 'Y':
+            if not args.key_id:
+                args.key_id = input("Please enter the API Key ID: ")
+            if not args.api_key:
+                args.api_key = input("Please enter the API Key: ")
+            creds = wyze_login_api_key(args.user, args.password, args.key_id, args.api_key)
+        else:
+            logging.info("Using legacy authentication (may not work for all devices)")
+            creds = wyze_login(args.user, args.password)
+    
     creds["refreshed"] = True
 
 if creds.pop('refreshed', False):
