@@ -55,6 +55,40 @@ class WyzeApiError(Exception):
         self.code = rsp["code"]
         self.msg = rsp["msg"]
 
+TLS_VERIFY = True
+REQUEST_TIMEOUT = 30
+
+def configure_tls(ca_bundle=None, insecure=False):
+    global TLS_VERIFY
+
+    if insecure:
+        TLS_VERIFY = False
+        logging.warning("TLS certificate verification is disabled (--insecure).")
+        return
+
+    if ca_bundle:
+        if not os.path.isfile(ca_bundle):
+            raise FileNotFoundError("CA bundle file not found: %s" % ca_bundle)
+        TLS_VERIFY = ca_bundle
+        logging.info("Using custom CA bundle: %s", ca_bundle)
+        return
+
+    # Prefer the interpreter's system CA bundle path when available.
+    # Some environments fail to validate specific chains with certifi but
+    # succeed with the platform OpenSSL trust store.
+    default_paths = ssl.get_default_verify_paths()
+    if default_paths.cafile and os.path.isfile(default_paths.cafile):
+        TLS_VERIFY = default_paths.cafile
+        logging.info("Using system CA bundle: %s", TLS_VERIFY)
+    else:
+        TLS_VERIFY = True
+        logging.info("Using default TLS verification settings from Requests.")
+
+def http_post(url, **kwargs):
+    kwargs.setdefault('timeout', REQUEST_TIMEOUT)
+    kwargs.setdefault('verify', TLS_VERIFY)
+    return requests.post(url, **kwargs)
+
 def auth_api(url, phone_id, params={}, payload={}):
     headers = {
         'Phone-Id': phone_id,
@@ -62,7 +96,7 @@ def auth_api(url, phone_id, params={}, payload={}):
         'X-API-Key': 'RckMFKbsds5p6QY3COEXc2ABwNTYY0q18ziEiSEm',
     }
 
-    rsp = requests.post(
+    rsp = http_post(
         AUTH_BASE_URL + url, headers=headers, params=params, json=payload).json()
     logging.debug(rsp)
     return rsp
@@ -83,7 +117,7 @@ def wyze_login_api_key(email, password, key_id, api_key):
     
     payload = {'email': email, 'password': password}
     
-    rsp = requests.post(
+    rsp = http_post(
         AUTH_BASE_URL + AUTH_LOGIN_URL, headers=headers, json=payload).json()
     logging.debug(rsp)
     
@@ -159,7 +193,7 @@ def device_api(creds, url, sv, **params):
     logging.debug(params)
     payload.update(params)
 
-    rsp = requests.post(API_BASE_URL + url, headers={'User-Agent': USER_AGENT}, json=payload).json()
+    rsp = http_post(API_BASE_URL + url, headers={'User-Agent': USER_AGENT}, json=payload).json()
     logging.debug(rsp)
     if rsp['code'] != '1':
         raise WyzeApiError(rsp)
@@ -181,7 +215,7 @@ def refresh_token(creds):
         }
         
         headers = {'Content-Type': 'application/json'}
-        rsp = requests.post(
+        rsp = http_post(
             API_BASE_URL + URL_REFRESH_TOKEN, headers=headers, json=payload).json()
         logging.debug(rsp)
         
@@ -251,7 +285,7 @@ def fetch_ota_info(creds, args):
     
     logging.debug("Sending payload: %s", payload)
     
-    response = requests.post(
+    response = http_post(
         UPDATE_VERSION_LIST_URL,
         headers={
             'User-Agent': USER_AGENT,
@@ -418,6 +452,12 @@ parser.add_argument(
     '--debug', action='store_true',
     help='Output debug informaiton.')
 parser.set_defaults(debug=False)
+parser.add_argument(
+    '--ca-bundle',
+    help='Path to a PEM CA bundle used for HTTPS certificate validation.')
+parser.add_argument(
+    '--insecure', action='store_true',
+    help='Disable HTTPS certificate validation (unsafe, troubleshooting only).')
 
 subparsers = parser.add_subparsers(
     dest='action', required=True,
@@ -483,6 +523,10 @@ update_parser.add_argument(
 args = parser.parse_args()
 
 log_init(args.debug)
+try:
+    configure_tls(args.ca_bundle, args.insecure)
+except FileNotFoundError as e:
+    parser.error(str(e))
 
 try:
     logging.info('Trying saved credentials from %s.', args.token)
